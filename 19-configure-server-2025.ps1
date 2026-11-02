@@ -81,7 +81,7 @@ function Set-PrivateProfileWithRetry {
         }
     }
     Write-Warning "Could not set Private profile after retries: $lastError"
-    Write-Warning "RDP is allowed on Private networks only. Once identification completes, run: Set-NetConnectionProfile -InterfaceIndex $InterfaceIndex -NetworkCategory Private"
+    Write-Warning "RDP is allowed on Domain and Private networks. Once identification completes, run: Set-NetConnectionProfile -InterfaceIndex $InterfaceIndex -NetworkCategory Private"
 }
 
 function Enable-VerifiedRemoteDesktop {
@@ -106,7 +106,7 @@ function Enable-VerifiedRemoteDesktop {
     New-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name UserAuthentication -PropertyType DWord -Value 1 -Force | Out-Null
     # Set firewall rules explicitly without relying on localized group names.
     Get-NetFirewallRule -Name 'RemoteDesktop-UserMode-In-TCP','RemoteDesktop-UserMode-In-UDP' -ErrorAction Stop |
-        Set-NetFirewallRule -Enabled True -Action Allow -Profile Private -ErrorAction Stop
+        Set-NetFirewallRule -Enabled True -Action Allow -Profile Domain,Private -ErrorAction Stop
 
     $port = (Get-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name PortNumber).PortNumber
     $listener = @()
@@ -128,7 +128,7 @@ function Enable-VerifiedRemoteDesktop {
     }
     Write-Host "RDP verified: connections allowed, TermService running, TCP port $port listening."
     Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory | Format-Table -AutoSize
-    Write-Host 'RDP firewall rules allow Private networks. The connection used for RDP must be Private.'
+    Write-Host 'RDP firewall rules allow Domain and Private networks.'
     Write-Host 'Close and reopen Settings to refresh the Remote Desktop switch. Test access from another computer.'
 }
 
@@ -326,3 +326,4 @@ try {
 
 Write-Host "`nConfiguration steps finished. Review any warnings above."
 Write-Host 'No reboot was requested. Reboot manually when ready to activate the new computer name and complete updates.'
+
