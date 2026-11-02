@@ -9,6 +9,8 @@ Prompts for adapter, static IPv4 settings, and computer name before changes.
 The IP change can disconnect remote access. No automatic reboot is performed.
 Use on a standalone server before joining a domain or installing Exchange.
 Existing Windows Update source settings still apply.
+Downloads and installs non-optional software updates, accepting their EULAs.
+Reports update results and restart requirements; never requests a restart.
 #>
 [CmdletBinding()]
 param()
@@ -80,6 +82,71 @@ function Set-PrivateProfileWithRetry {
     }
     Write-Warning "Could not set Private profile after retries: $lastError"
     Write-Warning "RDP is allowed on Private networks only. Once identification completes, run: Set-NetConnectionProfile -InterfaceIndex $InterfaceIndex -NetworkCategory Private"
+}
+
+function Install-AvailableWindowsUpdates {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $session.ClientApplicationID = 'Server 2025 initial setup'
+    $searcher = $session.CreateUpdateSearcher()
+    Write-Host 'Searching for software updates using the configured Windows Update source...'
+    $search = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Software' and BrowseOnly=0")
+    if ($search.ResultCode -ne 2) {
+        throw "Update search did not fully succeed (result $($search.ResultCode)). Rerun updates later."
+    }
+    if ($search.Updates.Count -eq 0) {
+        Write-Host 'No applicable non-optional software updates found.'
+        return
+    }
+    Write-Host "Found $($search.Updates.Count) update(s). Downloads and installation may take some time."
+    $resultNames = @('Not started', 'In progress', 'Succeeded', 'Succeeded with errors', 'Failed', 'Aborted')
+    $restartRequired = $false
+    # Install one at a time, including updates that require exclusive installation.
+    for ($i = 0; $i -lt $search.Updates.Count; $i++) {
+        $update = $search.Updates.Item($i)
+        Write-Host "[$($i + 1)/$($search.Updates.Count)] $($update.Title)"
+        if ($update.InstallationBehavior.CanRequestUserInput) {
+            Write-Warning 'Skipped: this update can require interactive input. Install it manually.'
+            continue
+        }
+        try {
+            if (-not $update.EulaAccepted) { $update.AcceptEula() }
+            $collection = New-Object -ComObject Microsoft.Update.UpdateColl
+            [void]$collection.Add($update)
+            if (-not $update.IsDownloaded) {
+                Write-Host 'Downloading...'
+                $downloader = $session.CreateUpdateDownloader()
+                $downloader.Updates = $collection
+                $download = $downloader.Download()
+                if (-not $update.IsDownloaded) {
+                    Write-Warning "Download incomplete (result $($download.ResultCode)); skipping this update."
+                    continue
+                }
+            }
+            $installer = $session.CreateUpdateInstaller()
+            $installer.Updates = $collection
+            $installer.AllowSourcePrompts = $false
+            $installer.ForceQuiet = $true
+            if ($installer.RebootRequiredBeforeInstallation) {
+                Write-Warning 'Windows requires a manual reboot before further update installation.'
+                $restartRequired = $true
+                break
+            }
+            Write-Host 'Installing...'
+            $installed = $installer.Install()
+            $detail = $installed.GetUpdateResult(0)
+            Write-Host "Installation result: $($resultNames[[int]$detail.ResultCode]); HRESULT: $($detail.HResult)"
+            if ($detail.ResultCode -ne 2) {
+                Write-Warning "Update did not fully succeed: $($update.Title)"
+            }
+            if ($installed.RebootRequired) { $restartRequired = $true }
+        } catch {
+            Write-Warning "Update failed: $($update.Title): $($_.Exception.Message)"
+        }
+    }
+    if ($restartRequired) {
+        Write-Host 'Updates require a reboot. Reboot manually when ready.'
+    }
+    Write-Host 'Update pass finished. After a manual reboot, check again for remaining or newly applicable updates.'
 }
 
 $system = Get-CimInstance Win32_ComputerSystem
@@ -156,7 +223,8 @@ Write-Host "`nAdapter: $($config.InterfaceAlias) ($interfaceIndex)"
 Write-Host "Static IPv4: $ip   Mask: $mask   Gateway: $gateway"
 Write-Host "DNS: $($dns -join ', ')"
 Write-Host "Computer name: $newName (effective after manual reboot)"
-Write-Host 'Enable RDP with NLA; set the selected network profile to Private; request update detection.'
+Write-Host 'Enable RDP with NLA; set the selected network profile to Private; download and install non-optional software updates.'
+Write-Host 'Update license terms will be accepted automatically. No automatic restart is requested.'
 Write-Warning 'IP changes can disconnect this session. Ensure the static address is excluded/reserved in DHCP to avoid duplicate allocation.'
 if ((Read-Host 'Type APPLY to continue') -cne 'APPLY') {
     Write-Host 'Cancelled; no changes applied.'
@@ -210,13 +278,10 @@ Write-Host 'Static IPv4 and DNS settings applied.'
 Set-PrivateProfileWithRetry -InterfaceIndex $interfaceIndex
 
 try {
-    # Uses the existing Windows Update/WSUS configuration. Detection only.
-    $automaticUpdates = New-Object -ComObject Microsoft.Update.AutoUpdate
-    $automaticUpdates.DetectNow()
-    Write-Host 'Windows Update detection requested; scanning runs asynchronously.'
+    Install-AvailableWindowsUpdates
 } catch {
-    Write-Warning "Update detection request failed: $($_.Exception.Message)"
+    Write-Warning "Windows Update operation failed: $($_.Exception.Message)"
 }
 
 Write-Host "`nConfiguration steps finished. Review any warnings above."
-Write-Host 'No reboot was requested. Reboot manually when ready to activate the new computer name.'
+Write-Host 'No reboot was requested. Reboot manually when ready to activate the new computer name and complete updates.'
