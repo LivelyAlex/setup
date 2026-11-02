@@ -84,6 +84,54 @@ function Set-PrivateProfileWithRetry {
     Write-Warning "RDP is allowed on Private networks only. Once identification completes, run: Set-NetConnectionProfile -InterfaceIndex $InterfaceIndex -NetworkCategory Private"
 }
 
+function Enable-VerifiedRemoteDesktop {
+    $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+    $policy = Get-ItemProperty -LiteralPath $policyPath -ErrorAction SilentlyContinue
+    if ($null -ne $policy -and $policy.fDenyTSConnections -eq 1) {
+        throw 'RDP is disabled by policy (fDenyTSConnections=1). Enable "Allow users to connect remotely by using Remote Desktop Services" in Local Group Policy, then rerun this script.'
+    }
+
+    Set-Service -Name TermService -StartupType Automatic
+    Start-Service -Name TermService
+    $namespace = 'root\cimv2\TerminalServices'
+    $setting = Get-CimInstance -Namespace $namespace -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
+    $result = Invoke-CimMethod -InputObject $setting -MethodName SetAllowTSConnections -Arguments @{
+        AllowTSConnections = [uint32]1
+        ModifyFirewallException = [uint32]0
+    } -ErrorAction Stop
+    if ($result.ReturnValue -ne 0) {
+        throw "SetAllowTSConnections failed with code $($result.ReturnValue)."
+    }
+    New-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name UserAuthentication -PropertyType DWord -Value 1 -Force | Out-Null
+    # Set firewall rules explicitly without relying on localized group names.
+    Get-NetFirewallRule -Name 'RemoteDesktop-UserMode-In-TCP','RemoteDesktop-UserMode-In-UDP' -ErrorAction Stop |
+        Set-NetFirewallRule -Enabled True -Action Allow -Profile Private -ErrorAction Stop
+
+    $port = (Get-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name PortNumber).PortNumber
+    $listener = @()
+    for ($attempt = 0; $attempt -lt 16; $attempt++) {
+        $listener = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+        if ($listener.Count -gt 0) { break }
+        if ($attempt -lt 15) { Start-Sleep -Seconds 2 }
+    }
+    $effective = Get-CimInstance -Namespace $namespace -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
+    $deny = (Get-ItemProperty -Path $terminalServer -Name fDenyTSConnections).fDenyTSConnections
+    if ($effective.AllowTSConnections -ne 1 -or $deny -ne 0) {
+        throw "RDP verification failed: AllowTSConnections=$($effective.AllowTSConnections), fDenyTSConnections=$deny. Check local policy."
+    }
+    if ($listener.Count -eq 0) {
+        throw "RDP is allowed, but no TCP listener appeared on port $port within 30 seconds. Inspect TermService and the RDP-Tcp listener configuration; no service restart or reboot was forced."
+    }
+    if ($port -ne 3389) {
+        Write-Warning "RDP uses custom port $port. Check that your firewall rules permit this port."
+    }
+    Write-Host "RDP verified: connections allowed, TermService running, TCP port $port listening."
+    Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory | Format-Table -AutoSize
+    Write-Host 'RDP firewall rules allow Private networks. The connection used for RDP must be Private.'
+    Write-Host 'Close and reopen Settings to refresh the Remote Desktop switch. Test access from another computer.'
+}
+
 function Install-AvailableWindowsUpdates {
     $session = New-Object -ComObject Microsoft.Update.Session
     $session.ClientApplicationID = 'Server 2025 initial setup'
@@ -254,14 +302,7 @@ if ($rename) {
     Write-Host 'Rename queued. This script will not reboot.'
 }
 
-$terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
-New-ItemProperty -Path $terminalServer -Name fDenyTSConnections -PropertyType DWord -Value 0 -Force | Out-Null
-New-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name UserAuthentication -PropertyType DWord -Value 1 -Force | Out-Null
-# Rule names are independent of Windows display language.
-Get-NetFirewallRule -Name 'RemoteDesktop-UserMode-In-TCP','RemoteDesktop-UserMode-In-UDP' |
-    Set-NetFirewallRule -Enabled True -Profile Private
-Start-Service TermService
-Write-Host 'RDP enabled with Network Level Authentication (Private firewall profile).'
+Enable-VerifiedRemoteDesktop
 
 # netsh is built into Windows and replaces DHCP with the requested static
 # configuration even when retaining the same address as the current DHCP lease.
