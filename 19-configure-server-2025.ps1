@@ -53,6 +53,35 @@ function ConvertTo-Mask {
     }) -join '.')
 }
 
+function Set-PrivateProfileWithRetry {
+    param([int]$InterfaceIndex, [int]$Attempts = 13, [int]$DelaySeconds = 5)
+    $lastError = 'No connection profile is available yet.'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $profiles = @(Get-NetConnectionProfile -InterfaceIndex $InterfaceIndex -ErrorAction Stop)
+            if ($profiles.Count -eq 0) { throw 'No connection profile is available yet.' }
+            if (@($profiles | Where-Object { $_.NetworkCategory -ne 'Private' }).Count -gt 0) {
+                Set-NetConnectionProfile -InterfaceIndex $InterfaceIndex -NetworkCategory Private -ErrorAction Stop
+            }
+            $verified = @(Get-NetConnectionProfile -InterfaceIndex $InterfaceIndex -ErrorAction Stop)
+            if ($verified.Count -eq 0 -or
+                @($verified | Where-Object { $_.NetworkCategory -ne 'Private' }).Count -gt 0) {
+                throw 'Network profile has not changed to Private yet.'
+            }
+            Write-Host 'Network profile verified as Private.'
+            return
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        if ($attempt -lt $Attempts) {
+            Write-Host "Waiting for network identification ($attempt/$Attempts)..."
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    Write-Warning "Could not set Private profile after retries: $lastError"
+    Write-Warning "RDP is allowed on Private networks only. Once identification completes, run: Set-NetConnectionProfile -InterfaceIndex $InterfaceIndex -NetworkCategory Private"
+}
+
 $system = Get-CimInstance Win32_ComputerSystem
 if ($system.PartOfDomain) {
     throw 'This script is for standalone servers before domain join.'
@@ -101,6 +130,15 @@ while ($true) {
     $invalidDNS = @($dns | Where-Object { -not (Test-IPv4 $_) })
     if ($dns.Count -gt 0 -and $invalidDNS.Count -eq 0) { break }
     Write-Warning 'Enter at least one valid DNS IPv4 address.'
+}
+if ($dns[0] -eq '192.168.225.201') {
+    # Always put .202 second; retain other supplied servers after it.
+    $dns = @('192.168.225.201', '192.168.225.202') + @(
+        $dns | Select-Object -Skip 1 | Where-Object {
+            $_ -ne '192.168.225.201' -and $_ -ne '192.168.225.202'
+        }
+    )
+    Write-Host 'Primary DNS is 192.168.225.201; secondary DNS set to 192.168.225.202.'
 }
 
 $proposedName = 'aVSRV{0}' -f (Get-Random -Minimum 1000 -Maximum 10000)
@@ -167,14 +205,9 @@ if ($LASTEXITCODE -ne 0) {
 Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ServerAddresses $dns
 Write-Host 'Static IPv4 and DNS settings applied.'
 
-foreach ($profile in @(Get-NetConnectionProfile -InterfaceIndex $interfaceIndex -ErrorAction SilentlyContinue)) {
-    try {
-        Set-NetConnectionProfile -InterfaceIndex $interfaceIndex -NetworkCategory Private
-        Write-Host 'Network profile set to Private.'
-    } catch {
-        Write-Warning "Could not set Private profile: $($_.Exception.Message)"
-    }
-}
+# Changing IP/DNS starts network identification again. Retry for up to 60 seconds,
+# including cases where Windows has not published any connection profile yet.
+Set-PrivateProfileWithRetry -InterfaceIndex $interfaceIndex
 
 try {
     # Uses the existing Windows Update/WSUS configuration. Detection only.
